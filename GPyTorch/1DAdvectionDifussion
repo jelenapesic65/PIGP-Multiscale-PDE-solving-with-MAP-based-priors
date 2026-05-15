@@ -1,0 +1,315 @@
+import math
+import torch
+import gpytorch 
+import matplotlib.pyplot as plt
+import numpy as np
+assert np.__version__ < "2", "numpy version must be < 2"
+from linear_operator.operators import LinearOperator
+
+
+def interp_indices(xs, U):
+    """Vectorized compute of left grid index j for each xs.
+    Returns j so that U[j] <= xs < U[j+1] (clamped at boundaries).
+    """
+    j = torch.searchsorted(U, xs) - 1
+    j = torch.clamp(j, 0, len(U) - 2)
+    return j
+
+
+def build_sparse_Wc(xc, U):
+    """Build sparse interpolation matrix for function values at xc.
+    Linear hat (2-point) interpolation: weights (1-t, t) on columns j and j+1.
+    Returns a torch.sparse_coo_tensor of shape (len(xc), len(U)).
+    """
+    n = len(xc)
+    m = len(U)
+    j = interp_indices(xc, U)
+    left = j
+    right = j + 1
+
+    # fraction t for each xc
+    denom = (U[right] - U[left]).to(xc.dtype)
+    t = (xc - U[left]) / denom
+
+    # rows and cols for COO
+    rows = torch.arange(n, dtype=torch.long).repeat_interleave(2)
+    cols = torch.stack([left, right], dim=1).reshape(-1)
+    vals = torch.stack([1 - t, t], dim=1).reshape(-1)
+
+    indices = torch.stack([rows, cols], dim=0)
+    W = torch.sparse_coo_tensor(indices, vals, size=(n, m))
+    return W.coalesce()
+
+
+def build_sparse_Wd1(xc, U, h):
+
+    n = len(xc)
+    m = len(U)
+    j = interp_indices(xc, U)
+    left = j
+    right = j + 1
+
+    rows = torch.arange(n, dtype=torch.long).repeat_interleave(2)
+    cols = torch.stack([left, right], dim=1).reshape(-1)
+    vals = torch.tensor([-1.0 / h, 1.0 / h], dtype=torch.float32).repeat(n)
+
+    indices = torch.stack([rows, cols], dim=0)
+    W1 = torch.sparse_coo_tensor(indices, vals, size=(n, m))
+    return W1.coalesce()
+
+
+def build_sparse_Wd2(xc, U, h):
+
+    n = len(xc)
+    m = len(U)
+    j = interp_indices(xc, U)  # j in [0, m-2]
+
+    # we will create three entries per row: cols (j-1, j, j+1)
+    rows = torch.arange(n, dtype=torch.long).repeat_interleave(3)
+
+    cols_left = j - 1
+    cols_mid = j
+    cols_right = j + 1
+
+    # clamp column indices to valid range, but this is a simple treatment.
+    cols_left = torch.clamp(cols_left, 0, m - 1)
+    cols_mid = torch.clamp(cols_mid, 0, m - 1)
+    cols_right = torch.clamp(cols_right, 0, m - 1)
+
+    cols = torch.stack([cols_left, cols_mid, cols_right], dim=1).reshape(-1)
+    vals = torch.tensor([1.0 / h ** 2, -2.0 / h ** 2, 1.0 / h ** 2], dtype=torch.float32).repeat(n)
+
+    indices = torch.stack([rows, cols], dim=0)
+    W2 = torch.sparse_coo_tensor(indices, vals, size=(n, m))
+    return W2.coalesce()
+
+
+def build_W_total(a, b, c, x, u, h, kappa, v):
+   
+    # boundary rows (2 x m)
+    m = len(u)
+    # bc indices/values
+    bc_rows = torch.tensor([[0, 1], [0, m - 1]], dtype=torch.long)
+    bc_vals = torch.tensor([1.0, 1.0], dtype=torch.float32)
+    W_bc = torch.sparse_coo_tensor(bc_rows, bc_vals, size=(2, m)).coalesce()
+
+    # collocation (f) rows
+    Wc = build_sparse_Wc(x_train[:ni], u)
+
+    # solution (u) rows -> derivatives
+    Wd1 = build_sparse_Wd1(x_train[ni:], u, h)
+    Wd2 = build_sparse_Wd2(x_train[ni:], u, h)
+
+    # PDE operator rows: v * Wd1 - kappa * Wd2
+    # both sparse; scalar ops preserve sparsity
+    Wpde = (v * Wd1) - (kappa * Wd2)
+
+    # concatenate sparse tensors: we collect COO indices + vals and shift row indices
+    # W_bc rows are already 0..1
+    def sparse_cat_rowwise(list_of_sparse):
+        # list_of_sparse: tensors with shapes (r_i, m) -> output stacked rows r_total x m
+        indices_list = []
+        vals_list = []
+        row_offset = 0
+        for S in list_of_sparse:
+            S = S.coalesce()
+            inds = S.indices().clone()
+            vals = S.values().clone()
+            # shift row indices by row_offset
+            inds[0, :] = inds[0, :] + row_offset
+            indices_list.append(inds)
+            vals_list.append(vals)
+            row_offset += S.size(0)
+        indices = torch.cat(indices_list, dim=1)
+        vals = torch.cat(vals_list, dim=0)
+        total_rows = row_offset
+        total_cols = m
+        return torch.sparse_coo_tensor(indices, vals, size=(total_rows, total_cols)).coalesce()
+
+    W = sparse_cat_rowwise([Wc, Wpde])
+    return W
+
+class PDEInterpolatedLinearOperator(LinearOperator):
+    """LinearOperator representing W K_UU W^T without forming the dense product.
+
+    - Kuu: a LazyTensor / LinearOperator for the kernel on the grid U
+    - W: sparse_coo_tensor with shape (N_obs, M_grid)
+    """
+    def __init__(self, Kuu, W):
+        self.Kuu = Kuu
+        self.W = W.coalesce()
+        super().__init__(Kuu,W)
+        
+    def _representation(self):
+        return (self.Kuu, self.W)
+    
+    def _size(self):
+        n_obs = self.W.size(0)
+        return torch.Size([n_obs, n_obs])
+
+    def _matmul(self, rhs):
+        """Compute (W Kuu W^T) @ rhs efficiently.
+        rhs is dense with shape (n_obs, k) or (n_obs,).
+        Steps:
+            v = W^T rhs        -> shape (M, k)
+            v = Kuu.matmul(v)  -> shape (M, k)  (uses structure of Kuu)
+            out = W v           -> shape (n_obs, k)
+        """
+        # Ensure rhs is 2D: (n_obs, k)
+        if rhs.dim() == 1:
+            rhs = rhs.unsqueeze(-1)
+            squeeze_out = True
+        else:
+            squeeze_out = False
+
+        # W^T @ rhs  -> use sparse.mm (sparse x dense -> dense)
+        v = torch.sparse.mm(self.W.transpose(0, 1), rhs)
+
+        # Kuu.matmul: Kuu is a LazyTensor / LinearOperator coming from a gpytorch kernel call
+        # Kuu.matmul accepts dense rhs of shape (M, k)
+        v = self.Kuu.matmul(v)
+
+        # W @ v
+        out = torch.sparse.mm(self.W, v)
+
+        if squeeze_out:
+            return out.squeeze(-1)
+        return out
+
+    def _t_matmul(self, rhs):
+        # (W Kuu W^T)^T = itself because symmetric
+        return self._matmul(rhs)
+    
+def u_exact(x, kappa, mu):
+ 
+    pi = math.pi
+    denom = pi**2 * kappa**2 + mu**2
+
+    A = kappa / denom
+    B = -mu / (math.pi * denom)
+    r = mu / kappa
+
+
+    e = math.exp(r)
+    C2 = (2*B) / (e - 1)
+    C1 = -B - C2
+
+    return (
+        C1
+        + C2*torch.exp(r*x)
+        + A*torch.sin(pi*x)
+        + B*torch.cos(pi*x)
+    )
+def f(x):
+    return np.sin(np.pi * x)
+a = 0
+b = 5
+n = 2000
+nc = 1000
+nt = 1000
+m = 400
+ni = 2+n
+x = torch.linspace(a, b, n)
+c = torch.linspace(a, b, nc)
+x_star = torch.linspace(a, b, nt)
+x_train = torch.cat([torch.tensor([a, b]), x, c])
+u = torch.linspace(a, b, m)
+grid_size = u[1] - u[0]
+h = u[1] - u[0]
+
+kappa_true = 0.6
+v_true = 0.3
+
+yx = u_exact(x, kappa_true, v_true) + 0.05*torch.randn_like(x)
+yc = f(c) + 0.05*torch.randn_like(c)
+yb = torch.tensor([0.0, 0.0]) 
+y_train = torch.cat([yb, yx, yc])
+
+l = 0.2
+sigma = 0.3
+sigma_n = 1e-2
+v = 0.5
+kappa = 0.3
+
+
+class GPRegressionModel(gpytorch.models.ExactGP):
+    def __init__(self, train_x, train_y, likelihood):
+        super(GPRegressionModel, self).__init__(train_x, train_y, likelihood)
+
+        # SKI requires a grid size hyperparameter. This util can help with that. Here we are using a grid that has the same number of points as the training data (a ratio of 1.0). Performance can be sensitive to this parameter, so you may want to adjust it for your own problem on a validation set.
+        grid_size = gpytorch.utils.grid.choose_grid_size(train_x,1.0)
+
+        self.mean_module = gpytorch.means.ConstantMean()
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.GridInterpolationKernel(
+                gpytorch.kernels.RBFKernel(), grid_size=grid_size, num_dims=1
+            )
+        )
+        self.raw_kappa = torch.nn.Parameter(torch.tensor(0.6))
+        self.raw_v = torch.nn.Parameter(torch.tensor(0.3))
+
+    @property
+    def kappa(self):
+        return torch.nn.functional.softplus(self.raw_kappa)
+    @property
+    def v(self):
+        return torch.nn.functional.softplus(self.raw_v)
+        
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        #covar_x = self.covar_module(x)
+        Kuu = self.covar_module.base_kernel.base_kernel(u.unsqueeze(-1))
+        W = build_W_total(a, b, c, x, u, float(h), self.kappa, self.v)
+        covar_x = PDEInterpolatedLinearOperator(Kuu, W) 
+        print('Covar shape:', covar_x.shape)
+        print('Mean shape:', mean_x.shape)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+
+likelihood = gpytorch.likelihoods.GaussianLikelihood()
+model = GPRegressionModel(x_train, y_train, likelihood)
+
+training_iterations = 50
+model.train()
+likelihood.train()
+
+optimizer = torch.optim.Adam(model.parameters(), lr=0.1)  
+
+mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model) #read the docs for this
+
+for i in range(training_iterations):
+    optimizer.zero_grad()
+    output = model(x_train)
+    loss = -mll(output, y_train)
+    loss.backward()
+    print(f"Iter {i + 1}/{training_iterations} - Loss: {loss.item():.3f}")
+    optimizer.step()
+
+print("Optimized Hyperparameters:")
+print(f"Likelihood noise: {likelihood.noise.item():.4f}")
+print(f"Mean constant: {model.mean_module.constant.item():.4f}")
+print(f"Kernel scale: {model.covar_module.outputscale.item():.4f}")
+print(f"RBF lengthscale: {model.covar_module.base_kernel.base_kernel.lengthscale.item():.4f}")
+print(f"Optimized v: {model.v.item():.4f}")
+print(f"Optimized kappa: {model.kappa.item():.4f}")
+
+model.eval()
+likelihood.eval()
+f,ax = plt.subplots(1,1, figsize=(10,6))
+with torch.no_grad(), gpytorch.settings.fast_pred_var(): #activates LOVE
+    predictions = likelihood(model(x_star))
+    mean = predictions.mean
+    lower, upper = predictions.confidence_region()
+
+def ax_plot(ax, x, mean, lower, upper, title):
+    x_exact = torch.linspace(a, b, 5000)
+
+    ax.plot(x_train.detach().numpy(), y_train.detach().numpy(), 'k*')
+    # Plot predictive means as blue line
+    ax.plot(x_star.detach().numpy(), mean.detach().numpy(), 'b')
+    # Plot confidence bounds as lightly shaded region
+    ax.fill_between(x_star.detach().numpy(), lower.detach().numpy(), upper.detach().numpy(), alpha=0.5)
+    ax.set_ylim([-3, 3])
+    ax.legend(['Observed Data', 'Mean', 'Confidence'])
+ax_plot(ax, x_star, mean, lower, upper, "GP Regression with SKI")
+plt.show()
